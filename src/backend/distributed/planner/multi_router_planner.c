@@ -2608,62 +2608,90 @@ IntersectPlacementList(List *lhsPlacementList, List *rhsPlacementList)
 
 
 /*
- * GroupInsertValuesByShardId takes care of grouping the rows from a multi-row
- * INSERT by target shard. At this point, all pruning has taken place and we
- * need only to build sets of rows for each destination. This is done by a
- * simple sort (by shard identifier) and gather step. The sort has the side-
- * effect of getting things in ascending order to avoid unnecessary deadlocks
- * during Task execution.
+ * Our group implemented an alternate approach for this function, which takes
+ * inspiration from virtual bucket distribution. In our implementation, the function
+ * uses a hash table to group rows from the INSERT by shardID, which in theory
+ * should help with the performance of our environment's range sharding
+ * implementation over the original "sort and iterate" approach. This is because
+ * the hash table maintains a time complexity of O(1). Even though this approach
+ * uses a hash table structure for the buckets, the range-distributed nature of our
+ * environment's distributed tables and shards remains the same, so we can take
+ * advantage of this to ideally see an improvement in performance.
+ * 
+ * Here's the general process we take:
+ * 
+ * 1. First, we create the hash table and configure it to hold the ModifyRoute
+ *    structure, so it'll contain a shard ID as well as the list of row values
+ *    held by the shard. This is our "bucket".
+ * 
+ * 2. Next, we iterate over all insert values, finding the appropriate bucket
+ *    for each value's shardID and creating a new one if we can't find any.
+ * 
+ * 3. After we iterate over every insert value, we convert the hash table
+ *    to a list of ModifyRoute entries. Then we free the hash table memory
+ *    and return the ModifyRoute list.
  */
 static List *
 GroupInsertValuesByShardId(List *insertValuesList)
 {
 	ModifyRoute *route = NULL;
-	ListCell *insertValuesCell = NULL;
+    ListCell *insertValuesCell = NULL;
 	List *modifyRouteList = NIL;
 
-	insertValuesList = SortList(insertValuesList, CompareInsertValuesByShardId);
-	foreach(insertValuesCell, insertValuesList)
-	{
-		InsertValues *insertValues = (InsertValues *) lfirst(insertValuesCell);
-		int64 shardId = insertValues->shardId;
-		bool foundSameShardId = false;
+    // setup hash table data structure for buckets
+    HASHCTL hashCtl;
+    HTAB *bucketHash = NULL;
+    bool found = false;
 
-		if (route != NULL)
-		{
-			if (route->shardId == shardId)
-			{
-				foundSameShardId = true;
-			}
-			else
-			{
-				/* new shard id seen; current aggregation done; add to list */
-				modifyRouteList = lappend(modifyRouteList, route);
-			}
-		}
+    // clear hashCtl
+    memset(&hashCtl, 0, sizeof(hashCtl));
+    
+    // define key and value sizes for hash table
+    hashCtl.keysize = sizeof(int64);
+    hashCtl.entrysize = sizeof(ModifyRoute);
 
-		if (foundSameShardId)
-		{
-			/*
-			 * Our current value has the same shard id as our aggregate object,
-			 * so append the rowValues.
-			 */
-			route->rowValuesLists = lappend(route->rowValuesLists,
-											insertValues->rowValues);
-		}
-		else
-		{
-			/* we encountered a new shard id; build a new aggregate object */
-			route = (ModifyRoute *) palloc(sizeof(ModifyRoute));
-			route->shardId = insertValues->shardId;
-			route->rowValuesLists = list_make1(insertValues->rowValues);
-		}
-	}
+    // use memory context to ensure hash table is cleaned up properly
+    hashCtl.hcxt = CurrentMemoryContext;
 
-	/* left holding one final aggregate object; add to list */
-	modifyRouteList = lappend(modifyRouteList, route);
+    // create hash table with initial size 128 buckets
+    bucketHash = hash_create("BucketHash", 128, &hashCtl, HASH_ELEM | HASH_CONTEXT);
 
-	return modifyRouteList;
+    // iterate over all insert values
+    foreach(insertValuesCell, insertValuesList)
+    {
+        InsertValues *insertValues = (InsertValues *) lfirst(insertValuesCell);
+        int64 shardId = insertValues->shardId;
+
+        // search for a bucket to hold current shard ID
+        route = (ModifyRoute *) hash_search(bucketHash, &shardId, HASH_ENTER, &found);
+
+        if (!found)
+        {
+            // if no existing bucket found, create new ModifyRoute structure
+            route->shardId = shardId;
+            route->rowValuesLists = NIL; // start with empty list
+        }
+
+        // add current row's values to bucket's list
+        route->rowValuesLists = lappend(route->rowValuesLists, insertValues->rowValues);
+    }
+
+    // initialize hash table sequence, convert bucket hash table to a list for further processing
+	HASH_SEQ_STATUS status;
+    hash_seq_init(&status, bucketHash);
+
+    // iterate through hash table entries
+    while ((route = (ModifyRoute *) hash_seq_search(&status)) != NULL)
+    {
+        // append each to a list of ModifyRoute entries
+        modifyRouteList = lappend(modifyRouteList, route);
+    }
+
+    // release hash table memory
+    hash_destroy(bucketHash);
+
+    // return list of ModifyRoute entries
+    return modifyRouteList;
 }
 
 
